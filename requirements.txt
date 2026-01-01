@@ -1,0 +1,7 @@
+streamlit
+pandas
+matplotlib
+xlsxwriter
+python-docx
+google-generativeai
+openpyxl
