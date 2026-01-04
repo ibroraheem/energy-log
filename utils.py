@@ -24,6 +24,16 @@ def load_data(file):
         if file.name.endswith('.xlsx') or file.name.endswith('.xls'):
             # It's an Excel file
             df = pd.read_excel(file)
+            
+            # Check for header issue: if columns are "Unnamed" and first row looks like headers
+            # A simple heuristic: check if 'localtime' or 'watt' or 'date' is in the first row values
+            first_row_vals = [str(x).lower() for x in df.iloc[0].values] if not df.empty else []
+            if any('localtime' in x or 'watt' in x or 'date' in x for x in first_row_vals):
+                # Reload with header=1
+                file.seek(0)
+                df = pd.read_excel(file, header=1)
+                st.info("Detected header in second row. Reloaded file.")
+
         else:
             # Assume CSV
             df = pd.read_csv(file)
@@ -40,7 +50,8 @@ def load_data(file):
     # 3. 'timestamp'
     # 4. Any column with 'date' or 'time'
     
-    columns_lower = [c.lower() for c in df.columns]
+    # Normalize columns: strip whitespace and lower case, ensure string
+    columns_lower = [str(c).strip().lower() for c in df.columns]
     
     if 'localtime' in columns_lower:
         col_map['timestamp'] = df.columns[columns_lower.index('localtime')]
@@ -50,7 +61,7 @@ def load_data(file):
         col_map['timestamp'] = df.columns[columns_lower.index('timestamp')]
     else:
         # Fallback to substring search
-        time_cols = [c for c in df.columns if 'time' in c.lower() or 'date' in c.lower()]
+        time_cols = [c for c in df.columns if 'time' in str(c).lower() or 'date' in str(c).lower()]
         if time_cols:
             col_map['timestamp'] = time_cols[0]
         else:
@@ -60,7 +71,7 @@ def load_data(file):
     st.info(f"Identified Timestamp Column: {col_map['timestamp']}")
 
     # Power
-    power_cols = [c for c in df.columns if ('watt' in c.lower() or 'power' in c.lower()) and 'factor' not in c.lower()]
+    power_cols = [c for c in df.columns if ('watt' in str(c).lower() or 'power' in str(c).lower()) and 'factor' not in str(c).lower()]
     if power_cols:
         col_map['power'] = power_cols[0]
         st.info(f"Identified Power Column: {col_map['power']}")
@@ -69,7 +80,7 @@ def load_data(file):
         return None, None
 
     # Power Factor
-    pf_cols = [c for c in df.columns if 'pf' in c.lower() or 'factor' in c.lower()]
+    pf_cols = [c for c in df.columns if 'pf' in str(c).lower() or 'factor' in str(c).lower()]
     if pf_cols:
         col_map['pf'] = pf_cols[0]
     else:
@@ -124,44 +135,90 @@ def load_data(file):
 
 def calculate_metrics(df):
     """
-    Aggregates data and calculates required metrics.
+    Aggregates data and calculates required metrics using interval-based logic.
     """
     df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+    df['Day'] = df['Timestamp'].dt.date # Use full date to handle multi-month data correctly
     df['Hour'] = df['Timestamp'].dt.hour
     
-    hourly_profile = df.groupby('Hour')['kW'].mean()
+    # Detect Interval
+    # Calculate median time difference in minutes
+    if len(df) > 1:
+        # distinct timestamps
+        unique_times = df['Timestamp'].sort_values().unique()
+        if len(unique_times) > 1:
+            diffs = pd.Series(unique_times).diff().dt.total_seconds() / 60.0
+            median_interval_min = diffs.median()
+        else:
+            median_interval_min = 60 # Default to hourly if only 1 timestamp? or 0?
+    else:
+        median_interval_min = 60 # Default
 
-    global_peak_kw = df['kW'].max()
-    peak_timestamp = df.loc[df['kW'].idxmax(), 'Timestamp']
+    st.info(f"Detected Data Interval: {median_interval_min:.2f} minutes")
+
+    if median_interval_min < 55: # Tolerance for 1-hour
+        # Sub-hourly: Use SUM (Accumulated Load)
+        agg_method = 'sum'
+        metric_label = 'Accumulated Power (kW)'
+        # Sum of Watts/1000 for each specific hour
+        full_hourly_profile = df.groupby(['Day', 'Hour'])['kW'].sum()
+        
+        # Baseload: Average of the hourly SUMS
+        baseload_subset = full_hourly_profile.reset_index()
+        baseload_kw = baseload_subset[baseload_subset['Hour'].isin([1,2,3,4])]['kW'].mean()
+        
+    else:
+        # Hourly (or greater): Use MEAN (Average Inst. Power)
+        # If it's truly hourly, Mean = The Value itself.
+        agg_method = 'mean'
+        metric_label = 'Average Power (kW)'
+        full_hourly_profile = df.groupby(['Day', 'Hour'])['kW'].mean()
+        
+        # Baseload: Average of the hourly MEANS
+        baseload_subset = full_hourly_profile.reset_index()
+        baseload_kw = baseload_subset[baseload_subset['Hour'].isin([1,2,3,4])]['kW'].mean()
+
+    # Calculate Global Peak
+    global_peak_kw = full_hourly_profile.max()
     
+    # Find timestamp of peak
+    peak_day, peak_hour = full_hourly_profile.idxmax()
+    
+    # Approximate timestamp (first entry matching Day/Hour)
+    peak_timestamp_rows = df[(df['Day'] == peak_day) & (df['Hour'] == peak_hour)]
+    peak_timestamp = peak_timestamp_rows['Timestamp'].iloc[0] if not peak_timestamp_rows.empty else None
+
     avg_pf = df['Power Factor'].mean() if 'Power Factor' in df.columns else None
 
-    baseload_mask = (df['Hour'] >= 1) & (df['Hour'] <= 4)
-    baseload_kw = df.loc[baseload_mask, 'kW'].mean()
+    # For the chart, we keep the 0-23 Average Profile shape
+    avg_hourly_profile = full_hourly_profile.groupby('Hour').mean()
 
     return {
-        'hourly_profile': hourly_profile,
+        'hourly_profile': avg_hourly_profile, 
+        'full_profile': full_hourly_profile,
         'global_peak_kw': global_peak_kw,
         'peak_timestamp': peak_timestamp,
         'avg_pf': avg_pf,
-        'baseload_kw': baseload_kw
+        'baseload_kw': baseload_kw,
+        'agg_method': agg_method,
+        'metric_label': metric_label
     }
 
-def generate_chart(hourly_profile):
+def generate_chart(hourly_profile, label="Hourly Load Profile"):
     """
     Generates Matplotlib figure for the hourly profile.
     """
-    plt.style.use('ggplot') # Ensure style is set
+    plt.style.use('ggplot')
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.plot(hourly_profile.index, hourly_profile.values, marker='o', linestyle='-')
-    ax.set_title("Mean Daily Load Profile")
+    ax.set_title(label)
     ax.set_xlabel("Hour of Day")
     ax.set_ylabel("Power (kW)")
     ax.set_xticks(range(0, 24))
     ax.grid(True)
     return fig
 
-def generate_excel(df_raw, hourly_profile):
+def generate_excel(df_raw, hourly_profile, agg_method='sum'):
     """
     Generates an Excel file with raw data, formulas, and charts.
     """
@@ -173,70 +230,77 @@ def generate_excel(df_raw, hourly_profile):
         worksheet_raw = writer.sheets['Raw_Analysis']
         worksheet_profile = workbook.add_worksheet('Hourly_Profiles')
         
-        # Identify columns for formulas
-        # We need the Excel column letter for 'Hour' and 'kW' in 'Raw_Analysis'
-        # df_raw columns are written starting at A1 (headers). Data starts row 2.
         cols = df_raw.columns.tolist()
         
         def get_col_letter(name):
             try:
                 idx = cols.index(name)
-                # Convert 0-index to letter (A, B, C...)
-                # Simple implementation for < 26 columns
                 return chr(65 + idx)
             except ValueError:
                 return None
 
+        col_day = get_col_letter('Day')
         col_hour = get_col_letter('Hour')
         col_kw = get_col_letter('kW')
         
-        # Write Headers for Profile
-        worksheet_profile.write('A1', 'Hour of Day')
-        worksheet_profile.write('B1', 'Average Power (kW)')
-        
-        # Write Formulas for 0-23 hours
-        # Formula: =AVERAGEIF(Raw_Analysis!C:C, A2, Raw_Analysis!D:D)
-        # assuming C is Hour and D is kW.
-        
-        if col_hour and col_kw:
-            desc_format = workbook.add_format({'num_format': '0.00'})
-            
-            for i in range(24):
-                row = i + 2 # Excel is 1-indexed, +1 for header
-                
-                # Write Hour
-                worksheet_profile.write(f'A{row}', i)
-                
-                # Write Formula
-                # AVERAGEIF(range, criteria, [average_range])
-                # Range: Raw_Analysis!HourColumn:HourColumn
-                # Criteria: A{row} (the hour value in this sheet)
-                # AvgRange: Raw_Analysis!kWColumn:kWColumn
-                formula = f'=AVERAGEIF(Raw_Analysis!{col_hour}:{col_hour}, A{row}, Raw_Analysis!{col_kw}:{col_kw})'
-                worksheet_profile.write_formula(f'B{row}', formula, desc_format)
+        # Determine Label and Formula based on Agg Method
+        if agg_method == 'sum':
+            prof_header = 'Accumulated Power (kW)'
+            formula_base = 'SUMIFS'
         else:
-            # Fallback if columns not found (shouldn't happen if Calculate Metrics ran)
+            prof_header = 'Average Power (kW)'
+            formula_base = 'AVERAGEIFS'
+
+        # Write Headers for Profile
+        worksheet_profile.write('A1', 'Day')
+        worksheet_profile.write('B1', 'Hour')
+        worksheet_profile.write('C1', prof_header)
+        
+        if col_day and col_hour and col_kw:
+            desc_format = workbook.add_format({'num_format': '0.00'})
+            date_format = workbook.add_format({'num_format': 'yyyy-mm-dd'})
+            unique_days = sorted(df_raw['Day'].unique())
+            row = 2
+            for day in unique_days:
+                for h in range(24):
+                    worksheet_profile.write(f'A{row}', day, date_format)
+                    worksheet_profile.write(f'B{row}', h)
+                    
+                    if agg_method == 'sum':
+                         # SUMIFS(kW, Day_col, day, Hour_col, h)
+                         formula = f'=SUMIFS(Raw_Analysis!{col_kw}:{col_kw}, Raw_Analysis!{col_day}:{col_day}, A{row}, Raw_Analysis!{col_hour}:{col_hour}, B{row})'
+                    else:
+                         # AVERAGEIFS(kW, Day_col, day, Hour_col, h)
+                         formula = f'=AVERAGEIFS(Raw_Analysis!{col_kw}:{col_kw}, Raw_Analysis!{col_day}:{col_day}, A{row}, Raw_Analysis!{col_hour}:{col_hour}, B{row})'
+
+                    worksheet_profile.write_formula(f'C{row}', formula, desc_format)
+                    row += 1
+        else:
             worksheet_profile.write('C1', 'Error: Could not locate data columns for formulas.')
-            # Write static data as backup
             hourly_profile.to_excel(writer, sheet_name='Hourly_Profiles_Backup')
 
         # --- Add Chart ---
         chart = workbook.add_chart({'type': 'line'})
         
-        # Configure Series
-        # Categories (X): Hourly_Profiles!$A$2:$A$25
-        # Values (Y): Hourly_Profiles!$B$2:$B$25
+        worksheet_profile.write('H1', 'Hour')
+        worksheet_profile.write('I1', 'Avg ' + prof_header)
+        
+        for i in range(24):
+            r = i + 2
+            worksheet_profile.write(f'H{r}', i)
+            worksheet_profile.write_formula(f'I{r}', f'=AVERAGEIF(B:B, H{r}, C:C)', desc_format)
+
         chart.add_series({
-            'name':       'Mean Daily Load Profile',
-            'categories': '=Hourly_Profiles!$A$2:$A$25',
-            'values':     '=Hourly_Profiles!$B$2:$B$25',
+            'name':       'Average ' + prof_header,
+            'categories': f'=Hourly_Profiles!$H$2:$H$25',
+            'values':     f'=Hourly_Profiles!$I$2:$I$25',
             'line':       {'color': 'blue'},
         })
         
         chart.set_title ({'name': 'Daily Load Profile'})
         chart.set_x_axis({'name': 'Hour of Day'})
         chart.set_y_axis({'name': 'Power (kW)'})
-        chart.set_style(10) # A nice built-in style
+        chart.set_style(10)
         
         worksheet_profile.insert_chart('D2', chart)
 
@@ -256,6 +320,9 @@ def get_ai_analysis(metrics, api_key):
     You are a Technical Data Analyst.
     Write a direct, concise technical analysis (approx. 400-500 words) based on the metrics below.
     
+    IMPORTANT CONTEXT: 
+    The "Global Peak" and load profile values represent the ACCUMULATED hourly load (Sum of minute-interval readings), NOT the average instantaneous power. This explains why the values (e.g., >500 kW) may appear significantly higher than the facility's rated capacity (e.g., 50 kVA). Do not flag this as an error; interpret it as total hourly energy intensity.
+
     Constraints:
     - NO em dashes (—). Use colons or parentheses if needed.
     - NO conversational filler (e.g., "It is worth noting that...").
@@ -263,15 +330,15 @@ def get_ai_analysis(metrics, api_key):
     - Use active voice.
     
     Structure:
-    1. Load Profile: Consumption pattern, peak timing, baseload.
+    1. Load Profile: Consumption pattern, peak timing, baseload intensity.
     2. Power Factor: Efficiency implications.
-    3. Anomalies: Spikes or dips.
-    4. Implications: System health.
+    3. Anomalies: Spikes or dips (relative to the profile).
+    4. Implications: System health and energy intensity.
     
     Metrics:
-    - Global Peak: {metrics['global_peak_kw']:.2f} kW at {metrics['peak_timestamp']}
+    - Global Hourly Accumulated Peak: {metrics['global_peak_kw']:.2f} (Max of Hourly Sums) at {metrics['peak_timestamp']}
     - Average Power Factor: {metrics['avg_pf']:.2f}
-    - Nighttime Baseload (01:00-04:00): {metrics['baseload_kw']:.2f} kW
+    - Nighttime Accumulated Baseload (01:00-04:00): {metrics['baseload_kw']:.2f} (Avg of Hourly Sums)
     """
     
     try:
@@ -298,7 +365,7 @@ def generate_word_report(metrics, chart_fig, ai_text):
     hdr_cells[1].text = 'Value'
     
     row_cells = table.add_row().cells
-    row_cells[0].text = 'Global Peak Load'
+    row_cells[0].text = 'Global Accumulated Peak'
     row_cells[1].text = f"{metrics['global_peak_kw']:.2f} kW"
     
     row_cells = table.add_row().cells
@@ -310,7 +377,7 @@ def generate_word_report(metrics, chart_fig, ai_text):
     row_cells[1].text = f"{metrics['avg_pf']:.2f}"
     
     row_cells = table.add_row().cells
-    row_cells[0].text = 'Nighttime Baseload'
+    row_cells[0].text = 'Nighttime Accumulated Baseload'
     row_cells[1].text = f"{metrics['baseload_kw']:.2f} kW"
     
     doc.add_heading('Daily Load Profile', level=1)

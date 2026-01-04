@@ -32,7 +32,7 @@ if uploaded_file:
 
         # Chart
         st.subheader("Load Profile")
-        fig = utils.generate_chart(metrics['hourly_profile'])
+        fig = utils.generate_chart(metrics['hourly_profile'], label=metrics.get('metric_label', 'Hourly Load Profile'))
         st.pyplot(fig)
 
         # AI Analysis
@@ -41,7 +41,7 @@ if uploaded_file:
         
         if 'ai_analysis' not in st.session_state:
              st.session_state['ai_analysis'] = None
-
+ 
         if api_key:
             if st.button("Generate AI Observations"):
                 with st.spinner("Generating Observations..."):
@@ -56,7 +56,7 @@ if uploaded_file:
         # Downloads
         st.subheader("Downloads")
         
-        excel_data = utils.generate_excel(df_raw, metrics['hourly_profile'])
+        excel_data = utils.generate_excel(df_raw, metrics['hourly_profile'], agg_method=metrics.get('agg_method', 'sum'))
         st.download_button(
             label="Download Excel Report",
             data=excel_data,
