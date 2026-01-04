@@ -36,7 +36,44 @@ def load_data(file):
 
         else:
             # Assume CSV
-            df = pd.read_csv(file)
+            # Check for BOM
+            file.seek(0)
+            bom = file.read(2)
+            file.seek(0)
+            
+            detected_encoding = None
+            if bom == b'\xff\xfe':
+                detected_encoding = 'utf-16-le'
+            elif bom == b'\xfe\xff':
+                detected_encoding = 'utf-16-be'
+            
+            encodings = [detected_encoding] if detected_encoding else ['utf-8', 'utf-16', 'utf-16-le', 'ISO-8859-1', 'cp1252']
+            
+            for enc in encodings:
+                try:
+                    file.seek(0)
+                    df = pd.read_csv(file, encoding=enc)
+                    
+                    # Heuristic for valid load: check for expected keywords
+                    cols_clean = [str(c).strip().lstrip('\ufeff').lower() for c in df.columns]
+                    
+                    keywords = ['date', 'time', 'timestamp', 'localtime', 'watt', 'kw', 'power']
+                    if any(k in cols_clean for k in keywords):
+                         break
+                    
+                    # Also keep it if it looks visibly cleaner than previous?
+                    # For now, keyword match is strong signal.
+                except Exception:
+                    continue
+            else:
+                 # If we exhausted specific encodings, warn, but maybe we got a DF from last attempt?
+                 # No, loop var scope.
+                 pass
+            
+            if 'df' not in locals() or df is None:
+                 st.error("Failed to read CSV with common encodings.")
+                 return None, None
+
     except Exception as e:
         st.error(f"Error reading file: {e}")
         return None, None
@@ -44,29 +81,44 @@ def load_data(file):
     # Column Identification
     col_map = {}
     
+    # Normalize columns: strip whitespace and lower case, ensure string
+    # Remove BOM artifacts if any remain in column names
+    df.columns = [str(c).strip().lstrip('\ufeff').lower() for c in df.columns]
+    columns_lower = list(df.columns)
+
+    # 0. Check for separate Date and Time columns
+    if 'date' in columns_lower and 'time' in columns_lower:
+        try:
+             # Combine them
+             date_col = df.columns[columns_lower.index('date')]
+             time_col = df.columns[columns_lower.index('time')]
+             df['Combined_Timestamp'] = df[date_col].astype(str) + ' ' + df[time_col].astype(str)
+             col_map['timestamp'] = 'Combined_Timestamp'
+             st.info(f"Merged '{date_col}' and '{time_col}' into Timestamp.")
+        except Exception as e:
+             st.warning(f"Found Date and Time but failed to merge: {e}")
+
     # Timestamp identification priority:
     # 1. 'localtime' (explicit user mention)
     # 2. 'Date/Time' (common standard)
     # 3. 'timestamp'
     # 4. Any column with 'date' or 'time'
     
-    # Normalize columns: strip whitespace and lower case, ensure string
-    columns_lower = [str(c).strip().lower() for c in df.columns]
-    
-    if 'localtime' in columns_lower:
-        col_map['timestamp'] = df.columns[columns_lower.index('localtime')]
-    elif 'date/time' in columns_lower:
-        col_map['timestamp'] = df.columns[columns_lower.index('date/time')]
-    elif 'timestamp' in columns_lower:
-        col_map['timestamp'] = df.columns[columns_lower.index('timestamp')]
-    else:
-        # Fallback to substring search
-        time_cols = [c for c in df.columns if 'time' in str(c).lower() or 'date' in str(c).lower()]
-        if time_cols:
-            col_map['timestamp'] = time_cols[0]
+    if 'timestamp' not in col_map:
+        if 'localtime' in columns_lower:
+            col_map['timestamp'] = df.columns[columns_lower.index('localtime')]
+        elif 'date/time' in columns_lower:
+            col_map['timestamp'] = df.columns[columns_lower.index('date/time')]
+        elif 'timestamp' in columns_lower:
+            col_map['timestamp'] = df.columns[columns_lower.index('timestamp')]
         else:
-            st.error("Could not identify a Timestamp column (looking for 'localtime', 'Date/Time', 'timestamp', etc.).")
-            return None, None
+            # Fallback to substring search
+            time_cols = [c for c in df.columns if 'time' in str(c).lower() or 'date' in str(c).lower()]
+            if time_cols:
+                col_map['timestamp'] = time_cols[0]
+            else:
+                st.error("Could not identify a Timestamp column (looking for 'Date' + 'Time', 'localtime', 'Date/Time', 'timestamp', etc.).")
+                return None, None
             
     st.info(f"Identified Timestamp Column: {col_map['timestamp']}")
 
