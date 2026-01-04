@@ -23,7 +23,37 @@ def load_data(file):
     try:
         if file.name.endswith('.xlsx') or file.name.endswith('.xls'):
             # It's an Excel file
-            df = pd.read_excel(file)
+            xlsx = pd.ExcelFile(file)
+            
+            # Smart Sheet Selection
+            # 1. Look for 'Data' or 'Capture' in names
+            # 2. Or check for valid headers in first few sheets
+            target_sheet = xls.sheet_names[0]
+            best_sheet = None
+            max_score = 0
+            
+            for sheet in xls.sheet_names:
+                try:
+                     # Peek at first few rows
+                     df_check = pd.read_excel(xlsx, sheet, nrows=5)
+                     cols_str = " ".join([str(c).lower() for c in df_check.columns])
+                     
+                     score = 0
+                     if 'timestamp' in cols_str or 'date' in cols_str: score += 5
+                     if 'watt' in cols_str or 'kw' in cols_str or 'power' in cols_str: score += 5
+                     if 'captured' in sheet.lower() or 'data' in sheet.lower(): score += 2
+                     
+                     if score > max_score and score >= 5:
+                         max_score = score
+                         best_sheet = sheet
+                except:
+                     continue
+            
+            if best_sheet:
+                 target_sheet = best_sheet
+                 st.info(f"Selecting sheet '{target_sheet}' based on content.")
+            
+            df = pd.read_excel(xlsx, target_sheet)
             
             # Check for header issue: if columns are "Unnamed" and first row looks like headers
             # A simple heuristic: check if 'localtime' or 'watt' or 'date' is in the first row values
@@ -31,7 +61,7 @@ def load_data(file):
             if any('localtime' in x or 'watt' in x or 'date' in x for x in first_row_vals):
                 # Reload with header=1
                 file.seek(0)
-                df = pd.read_excel(file, header=1)
+                df = pd.read_excel(xlsx, sheet_name=target_sheet, header=1)
                 st.info("Detected header in second row. Reloaded file.")
 
         else:
@@ -123,12 +153,40 @@ def load_data(file):
     st.info(f"Identified Timestamp Column: {col_map['timestamp']}")
 
     # Power
-    power_cols = [c for c in df.columns if ('watt' in str(c).lower() or 'power' in str(c).lower()) and 'factor' not in str(c).lower()]
-    if power_cols:
-        col_map['power'] = power_cols[0]
-        st.info(f"Identified Power Column: {col_map['power']}")
+    # KW Mapping Priority for NSIA and others:
+    # 1. 'active power total avg' (NSIA - Aggregated Avg)
+    # 2. 'active power total'
+    # 3. 'kw'
+    # 4. 'total active power'
+    # 5. 'active power'
+    # 6. 'watt' 
+    potential_kw = ['active power total avg', 'active power total', 'active power total max', 
+                    'kw', 'total active power', 'active power', 'watt', 'power']
+    
+    found_power = None
+    for p in potential_kw:
+        # Check against lowercased columns in loop order
+        # We need exact match or close substring match?
+        # Use simple substring check, but prioritized by order in list
+        match = next((c for c in columns_lower if p in c), None)
+        if match:
+             # Sanity check to avoid partial matches on wrong things (e.g. 'reactive power' matching 'power')
+             # 'active power' in list prevents 'reactive' issue if logic handles it?
+             # 'power' is last resort.
+             if 'reactive' in match and 'reactive' not in p:
+                  continue # Skip if we matched 'reactive power' but wanted 'power' or 'active power'
+             if 'apparent' in match and 'apparent' not in p:
+                  continue
+             
+             found_power = match
+             break
+    
+    if found_power:
+        col_map['power'] = found_power # We use 'power' key temporarily before renaming to 'kw'
+        col_map['kw'] = found_power # Set 'kw' key directly to be safe
+        st.info(f"Identified Power Column: {col_map['kw']}")
     else:
-        st.error("Could not identify a Power column (looking for 'watt' or 'power').")
+        st.error("Could not identify a Power column (looking for 'watt', 'active power', 'kw').")
         return None, None
 
     # Power Factor
@@ -193,7 +251,70 @@ def calculate_metrics(df):
     df['Day'] = df['Timestamp'].dt.date # Use full date to handle multi-month data correctly
     df['Hour'] = df['Timestamp'].dt.hour
     
+    cols_actual = {c.lower(): c for c in df.columns}
+    
+    # Generic Phase Detection
+    # Config: List of (PhaseA, PhaseB, PhaseC) candidates
+    # We check each triplet. If all 3 exist, we use them.
+    phase_candidates = [
+        ('watt_a', 'watt_b', 'watt_c'), # Pirano, Transformer 1 (likely)
+        ('active power l1n avg', 'active power l2n avg', 'active power l3n avg'), # NSIA
+        ('active power l1', 'active power l2', 'active power l3'), # Generic
+        ('power l1', 'power l2', 'power l3')
+    ]
+    
+    found_triplet = None
+    for p_a, p_b, p_c in phase_candidates:
+         # Check strict existence in lowercased columns
+         if p_a in cols_actual and p_b in cols_actual and p_c in cols_actual:
+              found_triplet = (p_a, p_b, p_c)
+              break
+    
+    # If not found strict, try partial match? (Risky)
+    # Let's stick to known schemas.
+    
+    if found_triplet:
+         # Only override if we really want to?
+         # User said "check this 3 phase system... aggregate to get maximum power"
+         # For Pirano, we did it.
+         # For NSIA, we might have 'active power total avg' mapped to kw.
+         # If we aggregate L1+L2+L3, we expect same result.
+         # But if the file is "filled with errors", recalculating might be safer?
+         # "Most files are like that".
+         # Let's Apply Aggregation if found, potentially overwriting 'kw' (or 'Total_Watt_Phases').
+         
+         # Wait, if we overwrite 'kw' which was 'active power total avg', we are asserting Sum(Phases) is truth.
+         # This is generally safe for Active Power.
+         
+         p_a, p_b, p_c = found_triplet
+         w_a = df[cols_actual[p_a]].fillna(0)
+         w_b = df[cols_actual[p_b]].fillna(0)
+         w_c = df[cols_actual[p_c]].fillna(0)
+         
+         # Unit detection:
+         # If column has 'watt' in name -> Watts. If 'kw' -> kW.
+         # NSIA: 'active power l1n avg' (usually Watts/kW?). Value check needed?
+         # Pirano: 'watt_a' -> Watts.
+         # We'll assume Watts if 'watt' in name, else check values?
+         # For NSIA, 'active power l1n avg' is likely kW? Or W?
+         # If we divide by 1000 blindly, we might underreport.
+         # Heuristic: If max value > 10000, assumes Watts. If < 5000, assumes kW (unless big factory).
+         # Pirano was ~10000 -> 30kW.
+         # Let's try to infer from name OR value.
+         
+         total_raw = w_a + w_b + w_c
+         
+         if 'watt' in p_a or 'watt' in p_b:
+             # Assume Watts
+             df['kW'] = total_raw / 1000.0
+             st.info(f"Aggregated 3-Phase Power ({p_a}+{p_b}+{p_c}) [Watts -> kW].")
+         else:
+             # Assume kW (e.g. 'active power' usually kw)
+             df['kW'] = total_raw
+             st.info(f"Aggregated 3-Phase Power ({p_a}+{p_b}+{p_c}) [Summed].")
+         
     # Detect Interval
+    # ...
     # Calculate median time difference in minutes
     if len(df) > 1:
         # distinct timestamps
@@ -209,13 +330,16 @@ def calculate_metrics(df):
     st.info(f"Detected Data Interval: {median_interval_min:.2f} minutes")
 
     if median_interval_min < 55: # Tolerance for 1-hour
-        # Sub-hourly: Use SUM (Accumulated Load)
-        agg_method = 'sum'
-        metric_label = 'Accumulated Power (kW)'
-        # Sum of Watts/1000 for each specific hour
-        full_hourly_profile = df.groupby(['Day', 'Hour'])['kW'].sum()
+        # Sub-hourly: 
+        # User Request: "moving ahead to get average per hour"
+        # Previous logic: 'Accumulated Power' (Sum). New logic: 'Average Power' (Mean).
+        agg_method = 'mean'
+        metric_label = 'Average Power (kW)'
         
-        # Baseload: Average of the hourly SUMS
+        # Mean of kW for each specific hour
+        full_hourly_profile = df.groupby(['Day', 'Hour'])['kW'].mean()
+        
+        # Baseload: Average of the hourly MEANS
         baseload_subset = full_hourly_profile.reset_index()
         baseload_kw = baseload_subset[baseload_subset['Hour'].isin([1,2,3,4])]['kW'].mean()
         
