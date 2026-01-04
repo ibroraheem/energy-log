@@ -10,9 +10,19 @@ st.set_page_config(page_title="Energy Meter Log Analysis", layout="wide")
 st.title("Energy Meter Log Analysis")
 st.sidebar.header("Configuration")
 
-# Try to get key from secrets, otherwise input
-default_key = st.secrets["general"]["GEMINI_API_KEY"] if "general" in st.secrets and "GEMINI_API_KEY" in st.secrets["general"] else ""
-api_key = st.sidebar.text_input("Gemini API Key", value=default_key, type="password")
+# Securely load API Key
+try:
+    if "GEMINI_API_KEY" in st.secrets:
+        api_key = st.secrets["GEMINI_API_KEY"]
+    elif "general" in st.secrets and "GEMINI_API_KEY" in st.secrets["general"]:
+        api_key = st.secrets["general"]["GEMINI_API_KEY"]
+    else:
+        api_key = ""
+except FileNotFoundError:
+    import os
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+
+# Removed sidebar input to keep key hidden
 
 uploaded_file = st.sidebar.file_uploader("Upload Energy Log (CSV/Excel)", type=['csv', 'xlsx', 'xls'])
 
@@ -51,7 +61,7 @@ if uploaded_file:
             ai_text = st.session_state['ai_analysis']
             st.write(ai_text)
         elif not api_key:
-             st.warning("Enter Gemini API Key to enable AI observations.")
+             st.warning("AI observations disabled. Backend API Key not configured.")
 
         # Downloads
         st.subheader("Downloads")
