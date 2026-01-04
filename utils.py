@@ -19,10 +19,16 @@ def load_data(file):
     """
     Loads CSV data, identifies relevant columns, and performs unit conversion.
     """
+    # Determine file type and read
     try:
-        df = pd.read_csv(file)
+        if file.name.endswith('.xlsx') or file.name.endswith('.xls'):
+            # It's an Excel file
+            df = pd.read_excel(file)
+        else:
+            # Assume CSV
+            df = pd.read_csv(file)
     except Exception as e:
-        st.error(f"Error reading CSV: {e}")
+        st.error(f"Error reading file: {e}")
         return None, None
 
     # Column Identification
@@ -247,16 +253,20 @@ def get_ai_analysis(metrics, api_key):
     model = genai.GenerativeModel('gemini-2.5-flash')
     
     prompt = f"""
-    You are a Technical Data Analyst writing for a Senior Project Engineer.
-    Write a comprehensive and detailed technical analysis (approx. 500-600 words) based on the following energy meter metrics.
+    You are a Technical Data Analyst.
+    Write a direct, concise technical analysis (approx. 400-500 words) based on the metrics below.
     
-    Structure your response into these sections:
-    1. Load Profile Analysis: Discuss the daily consumption pattern, peak timing, and baseload.
-    2. Power Factor Assessment: Evaluate the efficiency implications of the average power factor.
-    3. Anomaly Detection: Highlight any unusual spikes or dips if evident from the metrics.
-    4. Operational Implications: Discuss what these metrics mean for the electrical system's health.
+    Constraints:
+    - NO em dashes (—). Use colons or parentheses if needed.
+    - NO conversational filler (e.g., "It is worth noting that...").
+    - Start sentences directly with the subject.
+    - Use active voice.
     
-    Tone: Professional, objective, and observation-based. Avoid generic advice; focus on the data.
+    Structure:
+    1. Load Profile: Consumption pattern, peak timing, baseload.
+    2. Power Factor: Efficiency implications.
+    3. Anomalies: Spikes or dips.
+    4. Implications: System health.
     
     Metrics:
     - Global Peak: {metrics['global_peak_kw']:.2f} kW at {metrics['peak_timestamp']}
@@ -277,11 +287,9 @@ def generate_word_report(metrics, chart_fig, ai_text):
     doc = Document()
     doc.add_heading('Energy Audit Report', 0)
     
-    doc.add_paragraph(f"Date: {pd.Timestamp.now().strftime('%Y-%m-%d')}")
-    doc.add_paragraph("To: Senior Project Engineer")
-    doc.add_paragraph("From: Technical Data Analyst")
+    # Removed Letter headers (Date, To, From) per user request
     
-    doc.add_heading('Summary', level=1)
+    doc.add_heading('System Metrics', level=1)
     
     table = doc.add_table(rows=1, cols=2)
     table.style = 'Table Grid'
@@ -313,7 +321,7 @@ def generate_word_report(metrics, chart_fig, ai_text):
     img_buffer.seek(0)
     doc.add_picture(img_buffer, width=Inches(6.0))
     
-    doc.add_heading('Observation', level=1)
+    doc.add_heading('Technical Analysis', level=1)
     doc.add_paragraph(ai_text)
     
     output = io.BytesIO()

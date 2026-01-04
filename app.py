@@ -14,7 +14,7 @@ st.sidebar.header("Configuration")
 default_key = st.secrets["general"]["GEMINI_API_KEY"] if "general" in st.secrets and "GEMINI_API_KEY" in st.secrets["general"] else ""
 api_key = st.sidebar.text_input("Gemini API Key", value=default_key, type="password")
 
-uploaded_file = st.sidebar.file_uploader("Upload Energy Log (CSV)", type=['csv'])
+uploaded_file = st.sidebar.file_uploader("Upload Energy Log (CSV/Excel)", type=['csv', 'xlsx', 'xls'])
 
 if uploaded_file:
     with st.spinner("Processing Data..."):
